@@ -67,6 +67,8 @@ class SpoolLink:
         self._ptc_spool_ids: List[int] = []
         self._active_spool_id: Optional[int] = None
         self._device_name: Optional[str] = None
+        self._channel_spool_ids: Dict[int, int] = {}
+        self._feed_detected: Dict[int, bool] = {}
 
         self.server.register_remote_method(RESOLVE_METHOD, self._resolve_spool)
         self.server.register_event_handler(
@@ -106,6 +108,8 @@ class SpoolLink:
             "filament_detect": None,
             "print_task_config": ["filament_spool_id"],
             "toolhead": ["extruder"],
+            "filament_feed left": None,
+            "filament_feed right": None,
         }, self._handle_status_update, {})
         self._handle_status_update(status, 0.)
 
@@ -114,6 +118,8 @@ class SpoolLink:
         self._channel_event_times = {}
         self._ptc_spool_ids = []
         self._active_spool_id = None
+        self._channel_spool_ids = {}
+        self._feed_detected = {}
 
     # -- Remote method / subscription callbacks -----------------------------
 
@@ -144,12 +150,35 @@ class SpoolLink:
                 self._ptc_spool_ids = new_ids
                 self._fire(self._sync_active_spool())
 
+        if self._sync_location:
+            for feed_key in ("filament_feed left", "filament_feed right"):
+                feed = status.get(feed_key)
+                if not isinstance(feed, dict):
+                    continue
+                for extruder_key, info in feed.items():
+                    if not isinstance(info, dict) or "filament_detected" not in info:
+                        continue
+                    self._handle_feed_channel(
+                        self._extruder_to_channel(extruder_key),
+                        bool(info["filament_detected"]))
+
         fd = status.get("filament_detect")
         if fd is None:
             return
         info_list = fd.get("info", [])
         for ch, info in enumerate(info_list):
             self._handle_filament_detect_channel(ch, info)
+
+    def _handle_feed_channel(self, channel: int, detected: bool) -> None:
+        prev = self._feed_detected.get(channel)
+        self._feed_detected[channel] = detected
+        if prev is True and detected is False:
+            spool_id = self._channel_spool_ids.pop(channel, None)
+            if spool_id:
+                logging.info(
+                    "[spoollink] ch%d: filament_feed reports empty, "
+                    "clearing location for spool %s", channel, spool_id)
+                self._fire(self._clear_location_for_spool(spool_id))
 
     def _handle_filament_detect_channel(self, ch: int, info: Any) -> None:
         if not isinstance(info, dict):
@@ -359,7 +388,8 @@ class SpoolLink:
             return resp.json()
         raise RuntimeError(f"HTTP {resp.status_code}: {resp.text()}")
 
-    async def _spoolman_patch_location(self, spool_id: int, location: str) -> dict:
+    async def _spoolman_patch_location(self, spool_id: int,
+                                       location: Optional[str]) -> dict:
         resp = await self.http_client.request(
             "PATCH", f"{self._spoolman_url}/api/v1/spool/{spool_id}",
             body={"location": location})
@@ -482,12 +512,22 @@ class SpoolLink:
             logging.error("[spoollink] spool %s: set location failed: %s",
                           spool_id, e)
 
+    async def _clear_location_for_spool(self, spool_id: int) -> None:
+        try:
+            await self._retry(self._spoolman_patch_location, spool_id, None)
+            logging.info("[spoollink] spool %s: location cleared", spool_id)
+        except Exception as e:
+            logging.error("[spoollink] spool %s: clear location failed: %s",
+                          spool_id, e)
+
     async def _apply_spool(self, channel: int, spool: dict, uid_hex: str,
                            cached: bool = False) -> None:
         spool_id = spool.get("id", 0)
-        if (self._sync_location and self._device_name and spool_id
-                and spool.get("location") != self._device_name and not cached):
-            self._fire(self._sync_location_for_spool(spool_id, self._device_name))
+        if self._sync_location:
+            self._channel_spool_ids[channel] = spool_id
+            if (self._device_name and spool_id
+                    and spool.get("location") != self._device_name and not cached):
+                self._fire(self._sync_location_for_spool(spool_id, self._device_name))
         filament = spool.get("filament", {})
         material = filament.get("material", "PLA")
         vendor = (filament.get("vendor") or {}).get("name", "Generic")
