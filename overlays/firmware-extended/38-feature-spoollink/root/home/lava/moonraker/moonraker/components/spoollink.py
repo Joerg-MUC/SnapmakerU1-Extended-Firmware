@@ -58,6 +58,7 @@ class SpoolLink:
         self._cache_dir: Optional[str] = config.get("cache_dir", None)
         self._force_generic_vendor = config.getboolean(
             "force_generic_vendor", False)
+        self._sync_location = config.getboolean("sync_location", False)
         self.http_client: HttpClient = self.server.lookup_component("http_client")
         self.klippy_apis: APIComp = self.server.lookup_component("klippy_apis")
 
@@ -65,6 +66,7 @@ class SpoolLink:
         self._toolhead_extruder: str = "extruder"
         self._ptc_spool_ids: List[int] = []
         self._active_spool_id: Optional[int] = None
+        self._device_name: Optional[str] = None
 
         self.server.register_remote_method(RESOLVE_METHOD, self._resolve_spool)
         self.server.register_event_handler(
@@ -77,10 +79,24 @@ class SpoolLink:
     async def component_init(self) -> None:
         logging.info(
             "spoollink starting (spoolman: %s, cache: %s, "
-            "force generic vendor: %s)",
+            "force generic vendor: %s, sync location: %s)",
             self._spoolman_url, self._cache_dir or "disabled",
-            self._force_generic_vendor)
+            self._force_generic_vendor, self._sync_location)
         await self._ensure_fields()
+        if self._sync_location:
+            self._device_name = self._get_device_name()
+            if not self._device_name:
+                logging.warning(
+                    "[spoollink] sync_location enabled but no device name "
+                    "configured (Settings > Maintenance > Device Name) — "
+                    "location sync disabled until a name is set")
+
+    def _get_device_name(self) -> str:
+        machine = self.server.lookup_component("machine", None)
+        if machine is None:
+            return ""
+        product_info = machine.get_system_info().get("product_info", {}) or {}
+        return (product_info.get("device_name") or "").strip()
 
     # -- Klippy lifecycle ---------------------------------------------------
 
@@ -343,6 +359,14 @@ class SpoolLink:
             return resp.json()
         raise RuntimeError(f"HTTP {resp.status_code}: {resp.text()}")
 
+    async def _spoolman_patch_location(self, spool_id: int, location: str) -> dict:
+        resp = await self.http_client.request(
+            "PATCH", f"{self._spoolman_url}/api/v1/spool/{spool_id}",
+            body={"location": location})
+        if resp.status_code == 200:
+            return resp.json()
+        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text()}")
+
     async def _spoolman_add_card_uid(self, spool: dict, card_uid: str) -> dict:
         uid_upper = card_uid.upper()
         existing = _parse_card_uids(spool)
@@ -449,9 +473,21 @@ class SpoolLink:
 
         await self._apply_spool(channel, spool, card_uid or "", cached=cached)
 
+    async def _sync_location_for_spool(self, spool_id: int, location: str) -> None:
+        try:
+            await self._retry(self._spoolman_patch_location, spool_id, location)
+            logging.info("[spoollink] spool %s: location set to %r",
+                         spool_id, location)
+        except Exception as e:
+            logging.error("[spoollink] spool %s: set location failed: %s",
+                          spool_id, e)
+
     async def _apply_spool(self, channel: int, spool: dict, uid_hex: str,
                            cached: bool = False) -> None:
         spool_id = spool.get("id", 0)
+        if (self._sync_location and self._device_name and spool_id
+                and spool.get("location") != self._device_name and not cached):
+            self._fire(self._sync_location_for_spool(spool_id, self._device_name))
         filament = spool.get("filament", {})
         material = filament.get("material", "PLA")
         vendor = (filament.get("vendor") or {}).get("name", "Generic")
