@@ -170,4 +170,17 @@ it does not maintain its own WebSocket connection.
    reporting remain unchanged.
 8. Klipper stores the metadata in `print_task_config` and notifies subscribers.
    `AFC_lane.get_status()` surfaces `spool_id` to Fluidd/Mainsail.
+9. When `sync_location` is enabled, `spoollink` keeps Spoolman's `location` field in
+   line with the loaded spools, using the printer name from `machine.get_system_info()`:
+   - On resolve (`_apply_spool`), the spool's location is set to the printer name unless
+     it already is. The previous spool on the same channel is cleared first if it is not
+     loaded on another channel. The channel-to-spool map (`_channel_spool_ids`) is updated.
+   - On a `filament_feed` transition from detected to empty, the location of the spool
+     recorded for that channel is cleared (`PATCH api/v1/spool/{id}` with `{"location": null}`).
+     Only the physical feed sensor triggers this, not RFID rescans.
+   - On Klippy `ready`, `GET api/v1/spool?limit=1000` lists all spools. Each spool whose
+     location equals the printer name and which is not in `print_task_config` or the
+     channel map is cleared. The channel map is rebuilt from the loaded spools first.
+   - `_channel_spool_ids` is in memory and reset on Klippy disconnect. The start-up
+     reconcile covers the gap that leaves.
 

@@ -34,6 +34,47 @@ Enable in the [firmware-config](firmware_config.md) web interface under
 URL including scheme and port (e.g. `http://192.168.1.100:7912`). Set the same
 toggle to **Disabled** to turn it off.
 
+## Location Tracking (`sync_location`)
+
+Optional. While a spool is loaded on a channel, SpoolLink writes the printer's
+name into the spool's `location` field in Spoolman. When the spool leaves the
+printer, the field is cleared again (set to `null`). Spoolman then shows which
+printer each spool is in.
+
+The printer name is the device name from **Settings > Maintenance > Device
+Name**. Without a device name the option stays inactive and a warning is
+logged.
+
+Not available in the firmware-config web interface. Enable it from the shell:
+
+```
+extended-config.py add extended2.cfg spoolman sync_location true
+```
+
+The Moonraker config is regenerated at each start, so restart Moonraker
+afterwards. Check the start banner in `moonraker.log`, which should show
+`sync location: True`.
+
+Behaviour:
+
+- **Load:** the location is written when a spool is resolved on a channel
+  (RFID scan, manual assignment, `SET_SPOOL_ID`). A write is skipped if the
+  spool already carries the printer name.
+- **Unload:** the location is cleared only on a real unload, detected by the
+  channel's feed sensor going from detected to empty. RFID rescans never
+  clear it.
+- **Replacement:** if a different spool is resolved onto a channel that still
+  holds a spool, the previous spool's location is cleared, unless it is loaded
+  on another channel.
+- **Start and reconnect:** all spools whose location is the printer name and
+  which are not loaded anymore are cleared. This removes stale entries left
+  behind by a missed unload while Klipper was disconnected.
+- A spool resolved only from the local cache (Spoolman unreachable) is not
+  written to Spoolman.
+
+Spoolman must be reachable for these writes. A failed write is retried a few
+times and then logged as an error.
+
 ## Apps
 
 Community apps that support SpoolLink, so scanning a tag resolves its spool
