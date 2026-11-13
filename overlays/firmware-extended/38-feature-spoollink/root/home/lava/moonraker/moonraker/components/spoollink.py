@@ -567,12 +567,18 @@ class SpoolLink:
                 self._channel_spool_ids.setdefault(ch, sid)
         loaded = set(self._channel_spool_ids.values()) | {
             sid for sid in self._ptc_spool_ids if sid}
-        try:
+        async def _fetch_spools() -> list:
             resp = await self.http_client.get(
                 f"{self._spoolman_url}/api/v1/spool?limit=1000", enable_cache=False)
             if resp.status_code != 200:
-                raise RuntimeError(f"HTTP {resp.status_code}: {resp.text()}")
-            spools = resp.json()
+                # `text` is a property of HttpResponse, not a method
+                raise RuntimeError(f"HTTP {resp.status_code}: {resp.text}")
+            return resp.json()
+
+        try:
+            # A single failed request at startup (busy system, Spoolman not
+            # reachable yet) must not skip the reconcile until the next restart.
+            spools = await self._retry(_fetch_spools)
         except Exception as e:
             logging.error("[spoollink] location reconcile failed: %s", e)
             return
