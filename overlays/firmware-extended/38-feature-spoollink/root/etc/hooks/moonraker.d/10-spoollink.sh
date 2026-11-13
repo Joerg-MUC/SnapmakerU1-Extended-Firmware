@@ -18,6 +18,9 @@ if [ "$1" = start ]; then
     SPOOLMAN_HOST=$(/usr/local/bin/extended-config.py get "$EXTENDED_CFG" spoolman host "" 2>/dev/null)
     FORCE_GENERIC_VENDOR=$(/usr/local/bin/extended-config.py get "$EXTENDED_CFG" spoolman force_generic_vendor false 2>/dev/null)
     SYNC_LOCATION=$(/usr/local/bin/extended-config.py get "$EXTENDED_CFG" spoolman sync_location false 2>/dev/null)
+    UNLOAD_LOCATION=$(/usr/local/bin/extended-config.py get "$EXTENDED_CFG" spoolman unload_location "" 2>/dev/null)
+    UNLOAD_LOCATION_LINE=""
+    [ -n "$UNLOAD_LOCATION" ] && UNLOAD_LOCATION_LINE="unload_location: $UNLOAD_LOCATION"
 
     if [ -n "$SPOOLMAN_HOST" ]; then
         mkdir -p "$(dirname "$MOONRAKER_CFG")" "$CACHE_DIR"
@@ -35,6 +38,7 @@ server: $SPOOLMAN_HOST
 cache_dir: $CACHE_DIR
 force_generic_vendor: $FORCE_GENERIC_VENDOR
 sync_location: $SYNC_LOCATION
+$UNLOAD_LOCATION_LINE
 EOF
         chown lava:lava "$MOONRAKER_CFG"
     else

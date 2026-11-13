@@ -83,12 +83,25 @@ The Moonraker config is regenerated at each start, so restart Moonraker
 afterwards. Check the start banner in `moonraker.log`, which should show
 `sync location: True`.
 
+By default a spool that leaves the printer gets an empty location. To send it
+back to a place of your choice instead (for example a storage shelf), set
+`unload_location`:
+
+```
+extended-config.py add extended2.cfg spoolman unload_location Storage
+```
+
+The value is used whenever a spool is released: on unload, when another spool
+replaces it, and for stale entries cleaned up at startup. If it is not set, the
+location is cleared. A value equal to the printer name is ignored with a
+warning. The start banner then shows `unload location: Storage`.
+
 Behaviour:
 
 - **Load:** the location is written when a spool is resolved on a channel
   (RFID scan, manual assignment, `SET_SPOOL_ID`). A write is skipped if the
   spool already carries the printer name.
-- **Unload:** the location is cleared only on a real unload, detected by the
+- **Unload:** the location is cleared (or set to `unload_location`) only on a real unload, detected by the
   channel's feed sensor going from detected to empty. RFID rescans never
   clear it.
 - **Replacement:** if a different spool is resolved onto a channel that still

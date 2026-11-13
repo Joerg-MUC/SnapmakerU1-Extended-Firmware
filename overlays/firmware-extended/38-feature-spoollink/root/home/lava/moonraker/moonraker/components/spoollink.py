@@ -60,6 +60,10 @@ class SpoolLink:
         self._force_generic_vendor = config.getboolean(
             "force_generic_vendor", False)
         self._sync_location = config.getboolean("sync_location", False)
+        # Location a spool returns to when it leaves the printer. Empty: the
+        # location is cleared (set to null) instead.
+        self._unload_location: str = (
+            config.get("unload_location", "") or "").strip()
         self.http_client: HttpClient = self.server.lookup_component("http_client")
         self.klippy_apis: APIComp = self.server.lookup_component("klippy_apis")
 
@@ -83,9 +87,11 @@ class SpoolLink:
     async def component_init(self) -> None:
         logging.info(
             "spoollink starting (spoolman: %s, cache: %s, "
-            "force generic vendor: %s, sync location: %s)",
+            "force generic vendor: %s, sync location: %s, "
+            "unload location: %s)",
             self._spoolman_url, self._cache_dir or "disabled",
-            self._force_generic_vendor, self._sync_location)
+            self._force_generic_vendor, self._sync_location,
+            self._unload_location or "clear")
         await self._ensure_fields()
         if self._sync_location:
             self._device_name = self._get_device_name()
@@ -94,6 +100,12 @@ class SpoolLink:
                     "[spoollink] sync_location enabled but no device name "
                     "configured (Settings > Maintenance > Device Name) — "
                     "location sync disabled until a name is set")
+            elif self._unload_location == self._device_name:
+                logging.warning(
+                    "[spoollink] unload_location equals the device name %r — "
+                    "ignoring it, locations are cleared instead",
+                    self._device_name)
+                self._unload_location = ""
 
     def _get_device_name(self) -> str:
         machine = self.server.lookup_component("machine", None)
@@ -401,7 +413,7 @@ class SpoolLink:
             body={"location": location})
         if resp.status_code == 200:
             return resp.json()
-        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text()}")
+        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text}")
 
     async def _spoolman_add_card_uid(self, spool: dict, card_uid: str) -> dict:
         uid_upper = card_uid.upper()
@@ -543,9 +555,16 @@ class SpoolLink:
                           spool_id, e)
 
     async def _clear_location_for_spool(self, spool_id: int) -> None:
+        # Called for every spool that left the printer (unload, replacement,
+        # stale entry at startup). Send it to unload_location if configured.
+        target = self._unload_location or None
         try:
-            await self._retry(self._spoolman_patch_location, spool_id, None)
-            logging.info("[spoollink] spool %s: location cleared", spool_id)
+            await self._retry(self._spoolman_patch_location, spool_id, target)
+            if target is None:
+                logging.info("[spoollink] spool %s: location cleared", spool_id)
+            else:
+                logging.info("[spoollink] spool %s: location reset to %r",
+                             spool_id, target)
         except Exception as e:
             logging.error("[spoollink] spool %s: clear location failed: %s",
                           spool_id, e)
