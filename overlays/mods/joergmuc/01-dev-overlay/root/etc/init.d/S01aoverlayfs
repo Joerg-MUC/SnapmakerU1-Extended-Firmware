@@ -1,0 +1,126 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:       mount-overlayfs
+# Default-Start:  S
+# Default-Stop:
+# Description:    Mount Overlayfs with an own overlay directory for this image
+### END INIT INFO
+
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Replacement for the stock S01aoverlayfs (see ../../pre-scripts/01-check-stock-init.sh).
+#
+# The writable overlay of the stock init lives in /oem/overlay and is bound to the
+# image it was created over. Mounting it over a different image fails with
+# "overlayfs: failed to verify upper root origin" and the system then runs without
+# overlay. A printer that holds a second image in the other A/B slot therefore needs
+# an own overlay directory per image.
+#
+# This image keeps its overlay in /oem/overlay-dev:
+#   - it is rebuilt when the image changes (stamp in /oem/overlay-dev/.image-id)
+#   - /oem/.debug is honoured like in the stock init (no flag, no persistence)
+#   - after a rebuild a few access and network files are seeded from the overlay of
+#     the other slot (/oem/overlay/upper), so SSH and Wi-Fi keep working
+#   - the overlay of the other slot is never touched
+
+OVERLAY_DIR=/oem/overlay-dev
+SEED_SOURCE=/oem/overlay/upper
+SEED_FILES="etc/dropbear/dropbear_ed25519_host_key
+etc/wpa_supplicant.conf
+etc/localtime
+etc/timezone
+etc/hooks/lmd.d/05-wifi-restore.sh
+root/.ssh/authorized_keys
+home/lava/.ssh/authorized_keys"
+
+image_id() {
+    echo "$(cat /etc/BUILD_VERSION 2>/dev/null)-$(stat -c %Y /etc/BUILD_VERSION 2>/dev/null)"
+}
+
+make_dirs() {
+    mkdir -p "$OVERLAY_DIR/upper" "$OVERLAY_DIR/work"
+    chmod 0755 "$OVERLAY_DIR/upper" "$OVERLAY_DIR/work"
+    image_id > "$OVERLAY_DIR/.image-id"
+}
+
+mount_overlay() {
+    mount -t overlay overlay -o "noatime,lowerdir=/overlay,upperdir=$OVERLAY_DIR/upper,workdir=$OVERLAY_DIR/work" /system
+}
+
+# Runs after pivot_root, so every write goes into the new overlay.
+seed_overlay() {
+    if [ ! -d "$SEED_SOURCE" ]; then
+        echo "overlayfs: no seed source $SEED_SOURCE"
+        return 0
+    fi
+    # /etc/dropbear is a symlink to /var/run/dropbear in the image. S50dropbear replaces
+    # it with a real directory in the overlay to persist the host key, do the same here.
+    if [ -L /etc/dropbear ]; then
+        rm -f /etc/dropbear
+    fi
+    for f in $SEED_FILES; do
+        src="$SEED_SOURCE/$f"
+        if [ -e "$src" ] || [ -L "$src" ]; then
+            mkdir -p "/$(dirname "$f")"
+            cp -a "$src" "/$f" && echo "overlayfs: seeded $f"
+        fi
+    done
+    # the .ssh directories do not exist in the image and must be private
+    [ -d /root/.ssh ] && chmod 700 /root/.ssh
+    if [ -d /home/lava/.ssh ]; then
+        chmod 700 /home/lava/.ssh
+        chown lava:lava /home/lava/.ssh
+    fi
+}
+
+case "$1" in
+    start|"")
+        if [ ! -d /system ];then
+            mkdir -p /system
+        fi
+        reseed=0
+        # the overlay belongs to exactly one image
+        if [ "$(cat "$OVERLAY_DIR/.image-id" 2>/dev/null)" != "$(image_id)" ]; then
+            echo "overlayfs: new image, rebuilding $OVERLAY_DIR"
+            rm -rf "$OVERLAY_DIR"
+            reseed=1
+        fi
+        # clear the overlayfs
+        if [ ! -f /oem/.debug ]; then
+            echo "reset overlayfs"
+            rm -rf "$OVERLAY_DIR"/*
+            reseed=1
+        fi
+        make_dirs
+        mount --bind -n / /overlay
+        if ! mount_overlay; then
+            echo "overlayfs: mount failed, rebuilding $OVERLAY_DIR"
+            rm -rf "$OVERLAY_DIR"
+            reseed=1
+            make_dirs
+            mount_overlay || echo "overlayfs: mount failed again"
+        fi
+        mount -n /proc --move /system/proc
+        pivot_root /system /system/overlay
+        mount -n /overlay/dev --move /dev
+        mount -n /overlay/tmp --move /tmp
+        mount -n /overlay/run --move /run
+        mount -n /overlay/sys --move /sys
+        mount -o noatime,move /overlay/oem /oem
+        mount -o noatime,move /overlay/userdata /userdata
+        # mount -n /overlay/overlay --move /overlay
+        if [ "$reseed" = 1 ]; then
+            seed_overlay
+        fi
+        ;;
+    restart|reload|force-reload)
+        # No-op
+        ;;
+    stop|status)
+        # No-op
+        ;;
+    *)
+        echo "Usage: start" >&2
+        exit 3
+        ;;
+esac
