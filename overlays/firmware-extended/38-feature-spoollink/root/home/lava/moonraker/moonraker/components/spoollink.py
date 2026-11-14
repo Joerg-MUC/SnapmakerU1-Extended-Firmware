@@ -76,6 +76,11 @@ class SpoolLink:
             force_lowercase=True)
         # Whether the server supports native tags: None until checked.
         self._tag_api_supported: Optional[bool] = None
+        self._sync_location = config.getboolean("sync_location", False)
+        # Location a spool returns to when it leaves the printer. Empty: the
+        # location is cleared (set to null) instead.
+        self._unload_location: str = (
+            config.get("unload_location", "") or "").strip()
         self.http_client: HttpClient = self.server.lookup_component("http_client")
         self.klippy_apis: APIComp = self.server.lookup_component("klippy_apis")
 
@@ -83,6 +88,9 @@ class SpoolLink:
         self._toolhead_extruder: str = "extruder"
         self._ptc_spool_ids: List[int] = []
         self._active_spool_id: Optional[int] = None
+        self._device_name: Optional[str] = None
+        self._channel_spool_ids: Dict[int, int] = {}
+        self._feed_detected: Dict[int, bool] = {}
 
         self.server.register_remote_method(RESOLVE_METHOD, self._resolve_spool)
         self.server.register_remote_method(UNLINK_METHOD, self._unlink_card)
@@ -96,12 +104,34 @@ class SpoolLink:
     async def component_init(self) -> None:
         logging.info(
             "spoollink starting (spoolman: %s, cache: %s, "
-            "force generic vendor: %s, tag store: %s)",
+            "force generic vendor: %s, tag store: %s, "
+            "sync location: %s, unload location: %s)",
             self._spoolman_url, self._cache_dir or "disabled",
             self._force_generic_vendor,
-            "native" if self._tag_api else "card_uids")
+            "native" if self._tag_api else "card_uids",
+            self._sync_location, self._unload_location or "clear")
         await self._check_tag_api()
         await self._ensure_fields()
+        if self._sync_location:
+            self._device_name = self._get_device_name()
+            if not self._device_name:
+                logging.warning(
+                    "[spoollink] sync_location enabled but no device name "
+                    "configured (Settings > Maintenance > Device Name) — "
+                    "location sync disabled until a name is set")
+            elif self._unload_location == self._device_name:
+                logging.warning(
+                    "[spoollink] unload_location equals the device name %r — "
+                    "ignoring it, locations are cleared instead",
+                    self._device_name)
+                self._unload_location = ""
+
+    def _get_device_name(self) -> str:
+        machine = self.server.lookup_component("machine", None)
+        if machine is None:
+            return ""
+        product_info = machine.get_system_info().get("product_info", {}) or {}
+        return (product_info.get("device_name") or "").strip()
 
     # -- Klippy lifecycle ---------------------------------------------------
 
@@ -111,14 +141,19 @@ class SpoolLink:
             "filament_detect": None,
             "print_task_config": ["filament_spool_id"],
             "toolhead": ["extruder"],
+            "filament_feed left": None,
+            "filament_feed right": None,
         }, self._handle_status_update, {})
         self._handle_status_update(status, 0.)
+        self._fire(self._reconcile_locations())
 
     def _handle_klippy_disconnect(self) -> None:
         logging.info("[spoollink] Klippy disconnected")
         self._channel_event_times = {}
         self._ptc_spool_ids = []
         self._active_spool_id = None
+        self._channel_spool_ids = {}
+        self._feed_detected = {}
 
     # -- Remote method / subscription callbacks -----------------------------
 
@@ -152,12 +187,44 @@ class SpoolLink:
                 self._ptc_spool_ids = new_ids
                 self._fire(self._sync_active_spool())
 
+        if self._sync_location:
+            for feed_key in ("filament_feed left", "filament_feed right"):
+                feed = status.get(feed_key)
+                if not isinstance(feed, dict):
+                    continue
+                for extruder_key, info in feed.items():
+                    if not isinstance(info, dict) or "filament_detected" not in info:
+                        continue
+                    self._handle_feed_channel(
+                        self._extruder_to_channel(extruder_key),
+                        bool(info["filament_detected"]))
+
         fd = status.get("filament_detect")
         if fd is None:
             return
         info_list = fd.get("info", [])
         for ch, info in enumerate(info_list):
             self._handle_filament_detect_channel(ch, info)
+
+    def _handle_feed_channel(self, channel: int, detected: bool) -> None:
+        prev = self._feed_detected.get(channel)
+        self._feed_detected[channel] = detected
+        if prev is True and detected is False:
+            spool_id = self._channel_spool_ids.pop(channel, None)
+            if spool_id and self._spool_on_other_channel(spool_id, channel):
+                # The same spool is still assigned to another channel (for
+                # example after the reader of this channel picked up the tag
+                # of a neighbouring spool). It is still in the printer, so
+                # its location must stay.
+                logging.info(
+                    "[spoollink] ch%d: filament_feed reports empty, spool %s "
+                    "is still on another channel, keeping location",
+                    channel, spool_id)
+            elif spool_id:
+                logging.info(
+                    "[spoollink] ch%d: filament_feed reports empty, "
+                    "clearing location for spool %s", channel, spool_id)
+                self._fire(self._clear_location_for_spool(spool_id))
 
     def _handle_filament_detect_channel(self, ch: int, info: Any) -> None:
         if not isinstance(info, dict):
@@ -428,6 +495,15 @@ class SpoolLink:
             return resp.json()
         raise RuntimeError(f"HTTP {resp.status_code}: {resp.text()}")
 
+    async def _spoolman_patch_location(self, spool_id: int,
+                                       location: Optional[str]) -> dict:
+        resp = await self.http_client.request(
+            "PATCH", f"{self._spoolman_url}/api/v1/spool/{spool_id}",
+            body={"location": location})
+        if resp.status_code == 200:
+            return resp.json()
+        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text}")
+
     async def _spoolman_add_card_uid(self, spool: dict, card_uid: str) -> dict:
         uid_upper = card_uid.upper()
         existing = self._card_uids(spool)
@@ -578,9 +654,88 @@ class SpoolLink:
 
         await self._apply_spool(channel, spool, card_uid or "", cached=cached)
 
+    async def _sync_location_for_spool(self, spool_id: int, location: str) -> None:
+        try:
+            await self._retry(self._spoolman_patch_location, spool_id, location)
+            logging.info("[spoollink] spool %s: location set to %r",
+                         spool_id, location)
+        except Exception as e:
+            logging.error("[spoollink] spool %s: set location failed: %s",
+                          spool_id, e)
+
+    async def _clear_location_for_spool(self, spool_id: int) -> None:
+        # Called for every spool that left the printer (unload, replacement,
+        # stale entry at startup). Send it to unload_location if configured.
+        target = self._unload_location or None
+        try:
+            await self._retry(self._spoolman_patch_location, spool_id, target)
+            if target is None:
+                logging.info("[spoollink] spool %s: location cleared", spool_id)
+            else:
+                logging.info("[spoollink] spool %s: location reset to %r",
+                             spool_id, target)
+        except Exception as e:
+            logging.error("[spoollink] spool %s: clear location failed: %s",
+                          spool_id, e)
+
+    def _spool_on_other_channel(self, spool_id: int, channel: int) -> bool:
+        return any(sid == spool_id for ch, sid in self._channel_spool_ids.items()
+                   if ch != channel)
+
+    async def _reconcile_locations(self) -> None:
+        # Clear the location of every spool that carries this printer's name
+        # but is not loaded anymore. Covers spools whose unload was missed
+        # while Klippy was disconnected, which the in-memory map forgets.
+        if not self._sync_location or not self._device_name:
+            return
+        # Rebuild the channel map from the loaded spools, so that unloads after
+        # a reconnect are still detected by the feed sensor.
+        for ch, sid in enumerate(self._ptc_spool_ids):
+            if sid:
+                self._channel_spool_ids.setdefault(ch, sid)
+        loaded = set(self._channel_spool_ids.values()) | {
+            sid for sid in self._ptc_spool_ids if sid}
+        async def _fetch_spools() -> list:
+            resp = await self.http_client.get(
+                f"{self._spoolman_url}/api/v1/spool?limit=1000", enable_cache=False)
+            if resp.status_code != 200:
+                # `text` is a property of HttpResponse, not a method
+                raise RuntimeError(f"HTTP {resp.status_code}: {resp.text}")
+            return resp.json()
+
+        try:
+            # A single failed request at startup (busy system, Spoolman not
+            # reachable yet) must not skip the reconcile until the next restart.
+            spools = await self._retry(_fetch_spools)
+        except Exception as e:
+            logging.error("[spoollink] location reconcile failed: %s", e)
+            return
+        for spool in spools:
+            spool_id = spool.get("id")
+            if (spool.get("location") == self._device_name
+                    and spool_id and spool_id not in loaded):
+                logging.info("[spoollink] spool %s: stale location, clearing",
+                             spool_id)
+                self._fire(self._clear_location_for_spool(spool_id))
+
     async def _apply_spool(self, channel: int, spool: dict, uid_hex: str,
                            cached: bool = False) -> None:
         spool_id = spool.get("id", 0)
+        if self._sync_location:
+            # A new spool on an occupied channel replaces the old one without
+            # a feed-sensor transition. Clear the old spool's location so it
+            # does not keep pointing at this printer.
+            previous = self._channel_spool_ids.get(channel)
+            if previous and previous != spool_id and not self._spool_on_other_channel(
+                    previous, channel):
+                logging.info(
+                    "[spoollink] ch%d: spool %s replaced by %s, clearing location",
+                    channel, previous, spool_id)
+                self._fire(self._clear_location_for_spool(previous))
+            self._channel_spool_ids[channel] = spool_id
+            if (self._device_name and spool_id
+                    and spool.get("location") != self._device_name and not cached):
+                self._fire(self._sync_location_for_spool(spool_id, self._device_name))
         filament = spool.get("filament", {})
         material = filament.get("material", "PLA")
         vendor = (filament.get("vendor") or {}).get("name", "Generic")
