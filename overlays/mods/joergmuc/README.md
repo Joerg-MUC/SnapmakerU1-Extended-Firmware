@@ -19,7 +19,10 @@ What the replacement `S01aoverlayfs` does:
   `/etc/BUILD_VERSION` and its mtime) or when `/oem/.debug` is missing (like the stock init)
 - after a rebuild, seeds a short list of files from the overlay of the other slot
   (`/oem/overlay/upper`): SSH host key, `authorized_keys` for `root` and `lava`, Wi-Fi
-  configuration and hook, time zone. Everything else starts from the image defaults.
+  configuration, time zone. Everything else starts from the image defaults.
+- ships the Wi-Fi restore hook `/etc/hooks/lmd.d/05-wifi-restore.sh` in the image. It restores
+  `/etc/wpa_supplicant.conf` from the GUI copy in `/oem/printer_data/gui/` (shared by both slots)
+  when the overlay has none, so Wi-Fi comes back even without seeding.
 - retries once with a fresh directory when the overlay mount fails
 
 The build fails if the stock `S01aoverlayfs` changes (checksum guard in `pre-scripts/`).

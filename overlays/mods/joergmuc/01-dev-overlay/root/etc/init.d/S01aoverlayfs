@@ -29,7 +29,6 @@ SEED_FILES="etc/dropbear/dropbear_ed25519_host_key
 etc/wpa_supplicant.conf
 etc/localtime
 etc/timezone
-etc/hooks/lmd.d/05-wifi-restore.sh
 root/.ssh/authorized_keys
 home/lava/.ssh/authorized_keys"
 
