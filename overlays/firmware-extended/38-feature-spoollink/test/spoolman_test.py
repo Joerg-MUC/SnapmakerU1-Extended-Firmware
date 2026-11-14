@@ -3,7 +3,7 @@
 # SPDX-PackageHomePage: https://github.com/paxx12-snapmaker-u1/SnapmakerU1-Extended-Firmware
 # SPDX-FileCopyrightText: Copyright (c) 2026 @paxx12
 
-"""Test SpoolLink's card UID stores against a live, empty Spoolman.
+"""Test SpoolLink's card UID stores and location sync against a live, empty Spoolman.
 
 Loads the real Moonraker `spoollink` component with stubbed Moonraker parts,
 and runs the real `spoollink_migrate.py` and firmware-config commands. The
@@ -125,7 +125,9 @@ class Server:
     def __init__(self):
         self.components = {"http_client": HttpClient(), "klippy_apis": KlippyAPI()}
 
-    def lookup_component(self, name):
+    def lookup_component(self, name, *default):
+        if default:
+            return self.components.get(name, default[0])
         return self.components[name]
 
     def register_remote_method(self, *args):
@@ -133,6 +135,14 @@ class Server:
 
     def register_event_handler(self, *args):
         pass
+
+
+class Machine:
+    def __init__(self, device_name):
+        self.device_name = device_name
+
+    def get_system_info(self):
+        return {"product_info": {"device_name": self.device_name}}
 
 
 class ConfigHelper:
@@ -308,6 +318,123 @@ def test_firmware_config(native):
         check("switch to card_uids", (result.returncode, current()), (0, "card_uids"))
 
 
+PRINTER = "testprinter"
+
+
+async def settle():
+    """Wait for the background tasks SpoolLink fires (location writes)."""
+    pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    await asyncio.gather(*pending, return_exceptions=True)
+
+
+async def test_location():
+    vendor = api("POST", "/vendor", {"name": "SpoolLink Location Test"})
+    filament = api("POST", "/filament", {
+        "name": "Location", "vendor_id": vendor["id"], "material": "PLA",
+        "density": 1.24, "diameter": 1.75, "color_hex": "00FF00"})
+
+    def spool(location=None):
+        body = {"filament_id": filament["id"]}
+        if location:
+            body["location"] = location
+        return api("POST", "/spool", body)["id"]
+
+    def location(spool_id):
+        return api("GET", f"/spool/{spool_id}").get("location")
+
+    async def link(**config):
+        config.setdefault("sync_location", True)
+        sl = load_spoollink(**config)
+        sl.server.components["machine"] = Machine(PRINTER)
+        await sl.component_init()
+        return sl
+
+    async def load(sl, channel, spool_id):
+        """Resolve a spool on a channel, as the RFID scan or SET_SPOOL_ID does."""
+        await sl._apply_spool(channel, api("GET", f"/spool/{spool_id}"), "")
+        await settle()
+
+    async def unload(sl, channel):
+        """Feed sensor goes from detected to empty."""
+        sl._handle_feed_channel(channel, True)
+        sl._handle_feed_channel(channel, False)
+        await settle()
+
+    print("-- location sync")
+    sl = await link()
+    a, b = spool(), spool()
+    await load(sl, 0, a)
+    check("load sets the printer name", location(a), PRINTER)
+    await unload(sl, 0)
+    check("unload clears the location", location(a), None)
+
+    await load(sl, 0, a)
+    await load(sl, 0, b)
+    check("replacement clears the old spool, sets the new one",
+          (location(a), location(b)), (None, PRINTER))
+    await unload(sl, 0)
+
+    foreign = spool("Shelf")
+    await load(sl, 1, foreign)
+    check("load overwrites another location", location(foreign), PRINTER)
+    await unload(sl, 1)
+
+    print("-- same spool on two channels")
+    await load(sl, 0, a)
+    await load(sl, 1, a)
+    await unload(sl, 1)
+    check("unload keeps the location while the spool is on another channel",
+          location(a), PRINTER)
+    await unload(sl, 0)
+    check("unload of the last channel clears it", location(a), None)
+
+    await load(sl, 0, a)
+    await load(sl, 1, a)
+    await load(sl, 0, b)
+    check("replacement keeps the old spool while it is on another channel",
+          (location(a), location(b)), (PRINTER, PRINTER))
+    await unload(sl, 0)
+    await unload(sl, 1)
+
+    print("-- startup reconcile")
+    stale, loaded = spool(PRINTER), spool(PRINTER)
+    other = spool("Shelf")
+    sl = await link()
+    sl._ptc_spool_ids = [loaded]
+    await sl._reconcile_locations()
+    await settle()
+    check("stale entry cleared, loaded spool and other locations kept",
+          (location(stale), location(loaded), location(other)), (None, PRINTER, "Shelf"))
+
+    print("-- unload_location")
+    sl = await link(unload_location="Storage")
+    await load(sl, 0, a)
+    await unload(sl, 0)
+    check("unload sets unload_location", location(a), "Storage")
+    await load(sl, 0, a)
+    check("load replaces unload_location", location(a), PRINTER)
+    await unload(sl, 0)
+
+    stale = spool(PRINTER)
+    sl._ptc_spool_ids = []
+    await sl._reconcile_locations()
+    await settle()
+    check("stale entry goes to unload_location", location(stale), "Storage")
+
+    sl = await link(unload_location=PRINTER)
+    check("unload_location equal to the printer name is ignored", sl._unload_location, "")
+    await load(sl, 0, a)
+    await unload(sl, 0)
+    check("location is cleared instead", location(a), None)
+
+    print("-- sync_location off")
+    sl = await link(sync_location=False)
+    keep = spool("Shelf")
+    await load(sl, 0, keep)
+    await unload(sl, 0)
+    check("location untouched", location(keep), "Shelf")
+
+
 def main():
     global URL
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
@@ -323,6 +450,7 @@ def main():
     print(f"Spoolman {version} at {URL}, native tags {'supported' if native else 'not supported'}")
 
     asyncio.run(test_stores(native))
+    asyncio.run(test_location())
     test_firmware_config(native)
 
     print(f"\n{_passes} passed, {_failures} failed")
