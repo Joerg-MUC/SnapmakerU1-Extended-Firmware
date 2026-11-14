@@ -103,7 +103,9 @@ Behaviour:
   spool already carries the printer name.
 - **Unload:** the location is cleared (or set to `unload_location`) only on a real unload, detected by the
   channel's feed sensor going from detected to empty. RFID rescans never
-  clear it.
+  clear it. If the same spool is still assigned to another channel (for
+  example because a reader picked up the tag of a neighbouring spool), the
+  location is kept.
 - **Replacement:** if a different spool is resolved onto a channel that still
   holds a spool, the previous spool's location is cleared, unless it is loaded
   on another channel.

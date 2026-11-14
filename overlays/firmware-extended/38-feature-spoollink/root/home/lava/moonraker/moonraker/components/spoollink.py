@@ -192,7 +192,16 @@ class SpoolLink:
         self._feed_detected[channel] = detected
         if prev is True and detected is False:
             spool_id = self._channel_spool_ids.pop(channel, None)
-            if spool_id:
+            if spool_id and self._spool_on_other_channel(spool_id, channel):
+                # The same spool is still assigned to another channel (for
+                # example after the reader of this channel picked up the tag
+                # of a neighbouring spool). It is still in the printer, so
+                # its location must stay.
+                logging.info(
+                    "[spoollink] ch%d: filament_feed reports empty, spool %s "
+                    "is still on another channel, keeping location",
+                    channel, spool_id)
+            elif spool_id:
                 logging.info(
                     "[spoollink] ch%d: filament_feed reports empty, "
                     "clearing location for spool %s", channel, spool_id)

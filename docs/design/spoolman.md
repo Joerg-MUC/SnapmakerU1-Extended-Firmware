@@ -177,7 +177,8 @@ it does not maintain its own WebSocket connection.
      loaded on another channel. The channel-to-spool map (`_channel_spool_ids`) is updated.
    - On a `filament_feed` transition from detected to empty, the location of the spool
      recorded for that channel is cleared (`PATCH api/v1/spool/{id}` with `{"location": null}`).
-     Only the physical feed sensor triggers this, not RFID rescans.
+     Only the physical feed sensor triggers this, not RFID rescans. If the spool is still
+     recorded for another channel, its location is kept.
    - On Klippy `ready`, `GET api/v1/spool?limit=1000` lists all spools. Each spool whose
      location equals the printer name and which is not in `print_task_config` or the
      channel map is cleared. The channel map is rebuilt from the loaded spools first.
