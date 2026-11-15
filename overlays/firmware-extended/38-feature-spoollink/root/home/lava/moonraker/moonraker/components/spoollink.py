@@ -146,6 +146,7 @@ class SpoolLink:
         }, self._handle_status_update, {})
         self._handle_status_update(status, 0.)
         self._fire(self._reconcile_locations())
+        self._fire(self._refresh_cache())
 
     def _handle_klippy_disconnect(self) -> None:
         logging.info("[spoollink] Klippy disconnected")
@@ -369,6 +370,64 @@ class SpoolLink:
             pass
         except Exception as e:
             logging.warning("[spoollink] cache delete failed for %s: %s", card_uid, e)
+
+    # Brings the cache in line with Spoolman while it is reachable. The record of
+    # every cached card is refreshed, and cards that no active spool carries any more
+    # (spool archived or deleted, tag moved to another spool) are dropped, so a stale
+    # card cannot resolve to the wrong spool during a Spoolman outage. Nothing is
+    # touched when Spoolman cannot be read.
+    async def _refresh_cache(self) -> None:
+        if not self._cache_dir or not os.path.isdir(self._cache_dir):
+            return
+
+        async def _fetch_spools() -> list:
+            resp = await self.http_client.get(
+                f"{self._spoolman_url}/api/v1/spool?limit=1000", enable_cache=False)
+            if resp.status_code != 200:
+                # `text` is a property of HttpResponse, not a method
+                raise RuntimeError(f"HTTP {resp.status_code}: {resp.text}")
+            return resp.json()
+
+        try:
+            if self._tag_api and not await self._check_tag_api():
+                return
+            spools = await self._retry(_fetch_spools)
+        except Exception as e:
+            logging.error("[spoollink] cache refresh skipped: %s", e)
+            return
+        if len(spools) >= 1000:
+            logging.warning("[spoollink] cache refresh skipped: spool list may be "
+                            "truncated")
+            return
+        holders: Dict[str, List[dict]] = {}
+        for spool in spools:
+            for uid in self._card_uids(spool):
+                holders.setdefault(uid.upper(), []).append(spool)
+        refreshed = dropped = 0
+        for name in sorted(os.listdir(self._cache_dir)):
+            uid = name[:-len(".json")] if name.endswith(".json") else ""
+            if not uid or name != f"{uid.upper()}.json":
+                continue
+            found = holders.get(uid, [])
+            if not found:
+                logging.info("[spoollink] cache: no active spool carries card %s, "
+                             "dropping it", uid)
+                self._delete_cache(uid)
+                dropped += 1
+            elif len(found) > 1:
+                logging.warning("[spoollink] cache: card %s is on several spools, "
+                                "leaving it", uid)
+            else:
+                try:
+                    with open(self._cache_path(uid)) as f:
+                        current = json.load(f)
+                except Exception:
+                    current = None
+                if current != found[0]:
+                    self._save_cache(uid, found[0])
+                    refreshed += 1
+        logging.info("[spoollink] cache refresh: %d refreshed, %d dropped",
+                     refreshed, dropped)
 
     # -- Spoolman REST ------------------------------------------------------
 

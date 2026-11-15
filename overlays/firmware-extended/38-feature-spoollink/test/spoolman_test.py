@@ -3,7 +3,7 @@
 # SPDX-PackageHomePage: https://github.com/paxx12-snapmaker-u1/SnapmakerU1-Extended-Firmware
 # SPDX-FileCopyrightText: Copyright (c) 2026 @paxx12
 
-"""Test SpoolLink's card UID stores and location sync against a live, empty Spoolman.
+"""Test SpoolLink's card UID stores, its card cache and location sync against a live, empty Spoolman.
 
 Loads the real Moonraker `spoollink` component with stubbed Moonraker parts,
 and runs the real `spoollink_migrate.py` and firmware-config commands. The
@@ -435,6 +435,80 @@ async def test_location():
     check("location untouched", location(keep), "Shelf")
 
 
+def get_record(spool_id):
+    return api("GET", f"/spool/{spool_id}")
+
+
+async def test_cache(native):
+    vendor = api("POST", "/vendor", {"name": "SpoolLink Cache Test"})
+    filament = api("POST", "/filament", {
+        "name": "Cache", "vendor_id": vendor["id"], "material": "PLA", "weight": 1000,
+        "density": 1.24, "diameter": 1.75, "color_hex": "0000FF"})
+
+    for store in ("card_uids", "native") if native else ("card_uids",):
+        print(f"-- card cache, {store} store")
+        prefix = "CC" if store == "card_uids" else "DD"
+
+        def spool(uid, archived=False):
+            body = {"filament_id": filament["id"]}
+            if store == "card_uids":
+                body["extra"] = {"card_uids": json.dumps(uid)}
+            spool_id = api("POST", "/spool", body)["id"]
+            if store == "native":
+                api("POST", f"/spool/{spool_id}/tag", {"uid": uid})
+            if archived:
+                api("PATCH", f"/spool/{spool_id}", {"archived": True})
+            return spool_id
+
+        with tempfile.TemporaryDirectory() as cache:
+            def put(uid, record):
+                with open(os.path.join(cache, f"{uid}.json"), "w") as f:
+                    json.dump(record, f)
+
+            def get(uid):
+                with open(os.path.join(cache, f"{uid}.json")) as f:
+                    return json.load(f)
+
+            def has(name):
+                return os.path.exists(os.path.join(cache, name))
+
+            a, b = spool(prefix + "01"), spool(prefix + "02")
+            gone = spool(prefix + "03", archived=True)
+            put(prefix + "01", {"id": a, "remaining_weight": -1})   # stale record
+            put(prefix + "02", get_record(b))                         # up to date
+            put(prefix + "03", {"id": gone})                          # archived spool
+            put(prefix + "04", {"id": 999999})                        # unknown card
+            with open(os.path.join(cache, "notes.txt"), "w") as f:
+                f.write("not a cache file")
+            if store == "card_uids":
+                # the same card on two active spools is ambiguous and left alone
+                e1, e2 = spool(prefix + "05"), spool(prefix + "05")
+                put(prefix + "05", {"id": e1})
+
+            link = load_spoollink(tag_store=store, cache_dir=cache)
+            await link._refresh_cache()
+            check("stale record refreshed", (get(prefix + "01")["id"], get(prefix + "01")["remaining_weight"]),
+                  (a, 1000.0))
+            check("up to date record kept", get(prefix + "02")["id"], b)
+            check("archived spool dropped", has(prefix + "03.json"), False)
+            check("unknown card dropped", has(prefix + "04.json"), False)
+            check("other files left alone", has("notes.txt"), True)
+            if store == "card_uids":
+                check("ambiguous card left alone", get(prefix + "05"), {"id": e1})
+
+            before = os.stat(os.path.join(cache, prefix + "01.json")).st_mtime_ns
+            await link._refresh_cache()
+            check("second run writes nothing",
+                  os.stat(os.path.join(cache, prefix + "01.json")).st_mtime_ns, before)
+
+            if store == "card_uids":
+                put(prefix + "06", {"id": 999999})
+                down = load_spoollink(tag_store=store, cache_dir=cache, server="http://127.0.0.1:9")
+                await down._refresh_cache()
+                check("nothing dropped while Spoolman is unreachable",
+                      (has(prefix + "01.json"), has(prefix + "06.json")), (True, True))
+
+
 def main():
     global URL
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
@@ -451,6 +525,7 @@ def main():
 
     asyncio.run(test_stores(native))
     asyncio.run(test_location())
+    asyncio.run(test_cache(native))
     test_firmware_config(native)
 
     print(f"\n{_passes} passed, {_failures} failed")
