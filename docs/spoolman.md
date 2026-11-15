@@ -89,6 +89,22 @@ The setting is stored as `tag_store` (`card_uids` or `native`) in the
 `[spoolman]` section of `extended2.cfg`. Editing it by hand switches the store
 without moving any links.
 
+## Card Cache
+
+SpoolLink keeps the last resolved spool of every scanned card in
+`/oem/printer_data/config/extended/spoollink/<UID>.json`. The cache is only used
+when Spoolman cannot be reached while a card is scanned.
+
+The cache is kept in line with Spoolman whenever it is reachable:
+
+- every successful scan overwrites the entry of that card
+- when Klipper becomes ready (Moonraker start, Klipper restart), SpoolLink reads the
+  active spools once, refreshes the entry of every cached card and removes the entries of
+  cards that no active spool carries any more (spool archived or deleted, tag moved to
+  another spool)
+- a card that is on several active spools is left alone, and nothing is touched when
+  Spoolman cannot be read
+
 ## Apps
 
 Community apps that support SpoolLink, so scanning a tag resolves its spool
